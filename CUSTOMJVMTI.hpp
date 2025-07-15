@@ -104,7 +104,7 @@ private:
     static void hookDefineClass() {
         HMODULE hJVM = GetModuleHandleA("jvm.dll");
         if (!hJVM) return;
-        void* addr = (void*)GetProcAddress(hJVM, "JNI_DefineClass");
+        void* addr = (void*)GetProcAddress(hJVM, "JVM_DefineClass");
         if (!addr) return;
         DWORD old;
         BYTE patch[5] = {0xE9};

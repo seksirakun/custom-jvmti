@@ -1,108 +1,82 @@
 # CustomJVMTI
 
-`CustomJVMTI` is a lightweight emulation of the JVM Tool Interface (JVMTI) functionality without relying on the official JVMTI library. Instead, it hooks into the JVM using Windows API inline hooks to capture class definitions and enable:
-
-* **Class conversion via registered bytecode converters**
-* **Event notifications for class loading and the virtual machine lifecycle**
-* **Capabilities management** (adding/getting capabilities)
-* **Getting loaded classes without using the ClassLoader API**
+CustomJVMTI is a lightweight and modular library for dynamically modifying the bytecode of Java classes by binding the JVM's `DefineClass` function via the C++ and JNI interface, without needing the standard JVMTI API.
 
 ---
-
 ## Features
 
-1. **Initialization**
-
-* `CustomJVMTI::init(JNIEnv* env, JavaVM* vm)` – captures the JNI environment and the `JavaVM` pointer, clears the internal state, and loads the hook onto `JNI_DefineClass`.
-
-2. **Capabilities**
-
-* `AddCapabilities(const std::vector<jlong>&)`
-* `GetCapabilities(std::vector<jlong>&)`
-
-3. **Class File Transformers**
-
-* `AddTransformer(TransformerCallback)` – Registers callbacks to modify raw class bytes before definition.
-
-4. **Class Loading Capture**
-
-* Uses `JNI_DefineClass` inline hooks to capture all class definitions.
-
-* Implements transformers, registers global references to loaded classes, and triggers `EV_CLASS_LOAD` events.
-
-5. **Loaded Classes**
-
-* `GetLoadedClasses(std::vector<jclass>&)` – Returns a snapshot of all classes loaded via the hook.
-
-6. **Event Notifications**
-
-* `SetEventNotificationMode(bool enable, EventType, EventCallback)` – subscribe/unsubscribe:
-
-* `EV_CLASS_LOAD`
-* `EV_CLASS_UNLOAD` (reserved)
-* `EV_VM_INIT` (reserved)
-* `EV_VM_DEATH` (reserved)
+* **Method-Level Binding**: You can modify the bytecode of any class and method by binding it with C++ callback functions.
+* **Converter Support**: First-level method binding, second-level additional manipulation with generic converter callbacks.
+* **Event Notifications**: Capture class load, unload, and virtual machine startup/death events.
+* **Thread Safe**: All critical sections are protected with `std::mutex`.
+* **Zero Library Plus**: Uses only the Windows API and JNI.
 
 ---
 
 ## Getting Started
 
-### Prerequisites
+### 1. Adding to the Project
 
-* Windows 7 or later
-* Visual Studio 2017+ or compatible C++ compiler
-* `jvm.dll` accessible from the Java JDK (OpenJDK/Oracle)
+1. Copy the `CustomJVMTI.hpp` file to your project's include directory.
+2. Ensure that the JNI and Windows SDK settings are configured in your project.
+3. The JVM DLL (jvm.dll) path must be in the linker settings.
 
-### Compiling
-
-1. Create a new C++ DLL project.
-2. Add `CUSTOM_CUSTOMJVMTI.hpp` to your project. 3. Ensure that your project is linked against the JVM import library (for example, `jvm.lib`).
-
-4. Compile as a 64-bit DLL (appropriate for your JVM architecture).
-
-### Usage
-
-1. Place the generated DLL alongside your Java application.
-
-2. The JVM will load your library (for example, via `-agentpath:your.dll`) or by placing it in the `java.library.path` directory.
-3. While the library is loading, call `CustomJVMTI::init(env, vm)` manually (for example, inside the `JNI_OnLoad` directory) or use the link. 4. Register the transformers:
+### 2. Agent/Load Code (Example)
 
 ```cpp
-CustomJVMTI::AddTransformer([](const std::string &name, const std::vector<unsigned char> &bytes) {
-// replace bytes...
-return bytes;
-});
-```
-5. Subscribe to events:
+#include "CustomJVMTI.hpp"
 
-```cpp
-CustomJVMTI::SetEventNotificationMode(true, CustomJVMTI::EV_CLASS_LOAD,
-[](const std::string &clsName) {
-printf("Loaded class: %s\n", clsName.c_str());
+// JNI Agent_OnLoad
+JNIEXPORT jint JNICALL Agent_OnLoad(JavaVM* vm, char* options, void* reserved) {
+JNIEnv* env;
+if (vm->GetEnv(reinterpret_cast<void**>(&env), JNI_VERSION_1_8) != JNI_OK) {
+return JNI_ERR;
+}
+
+// Set up a hook for bytecode operations
+CustomJVMTI::AddMethodHook(
+"net/minecraft/client/Minecraft",
+"runGameLoop",
+"()V",
+[](auto& cls, auto& mName, auto& mDesc, auto& data) {
+// Example: examine the first 50 bytes
+std::cout << "Hooked: " << cls << "#" << mName << mDesc << std::endl;
+return data;
 }
 );
-```
-6. Then, retrieve the loaded classes:
 
-```cpp
-std::vector<jclass> list;
-CustomJVMTI::GetLoadedClasses(list);
-// Use jclass references
+// Enable the JVMTI-like DefineClass hook
+CustomJVMTI::init(env, vm);
+return JNI_VERSION_1_8;
+}
 ```
 
 ---
+## API Usage
 
-## Notes and Limitations
+| Function | Description |
+| ---------------------------- | ---------------------------------------------------------------------------- |
+| `init(JNIEnv*, JavaVM*)` | Initializes hook operations. Must be called once. |
+| `AddMethodHook(cls, mName, mDesc, cb)` | Adds a C++ callback to the specified class method. |
+| `AddTransformer(cb)` | Adds a generic transformer callback to all defined classes. |
+| `SetEventNotificationMode(...);` | Listens for events such as class loading, etc. |
 
-* Supports Windows only; Linux/macOS require different binding mechanisms.
-* `EV_CLASS_UNLOAD`, `EV_VM_INIT`, and `EV_VM_DEATH` are reserved but not fully implemented.
-* Thread suspend/resume and full JVMTI stack trace inspection are not provided.
-* Changes depend on inlining patching of `JNI_DefineClass`. Make sure your JVM exports this symbol.
+---
+
+## Things to Note
+
+* Because the JVM patches the `DefineClass` code path, hook operations may fail depending on the version and environment.
+* Security and stability testing is required in production environments.
+* Bytecode incompatibility in hooked classes may cause a JVM crash.
+
+---
+
+## Contributors
+
+* Veysel & Rakun & Batuzane & Axirus
 
 ---
 
 ## License
 
-MIT License — feel free to adapt it to your own needs.
-
-Used by veysel,batuzane,rakun,beyaz,axirus,serhat
+MIT © seksirakun48

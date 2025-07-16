@@ -1,5 +1,5 @@
 #ifndef CUSTOM_JVMTI_HPP
-#define CUSTOM_CUSTOMJVMTI_HPP
+#define CUSTOM_JVMTI_HPP
 
 #include <windows.h>
 #include <jni.h>
@@ -7,127 +7,146 @@
 #include <string>
 #include <unordered_map>
 #include <mutex>
+#include <functional>
+#include <iostream>
 
-// seftali for sonoyuncu by veysel & rakun
+struct MethodHook {
+    std::string className;
+    std::string methodName;
+    std::string methodDesc;
+    std::function<std::vector<unsigned char>(const std::string& cls,
+                                            const std::string& mName,
+                                            const std::string& mDesc,
+                                            const std::vector<unsigned char>& bytes)> converter;
+};
 
 class CustomJVMTI {
 public:
+    enum EventType { EV_CLASS_LOAD = 1, EV_CLASS_UNLOAD, EV_VM_INIT, EV_VM_DEATH };
+
+    using TransformerCallback = std::function<std::vector<unsigned char>(const std::string&,
+                                                                        const std::vector<unsigned char>&)>;
+    using EventCallback = std::function<void(const std::string&)>;
+
+    static void AddMethodHook(const std::string& cls,
+                              const std::string& mName,
+                              const std::string& mDesc,
+                              MethodHook::converter_t cb) {
+        std::lock_guard<std::mutex> lk(mutex_);
+        methodHooks_.push_back({cls, mName, mDesc, cb});
+    }
+
     static void init(JNIEnv* env, JavaVM* vm) {
         std::lock_guard<std::mutex> lk(mutex_);
-        jnienv = env;
-        jvm = vm;
-        capabilities.clear();
-        eventHandlers.clear();
-        transformers.clear();
-        loadedClasses.clear();
+        if (initialized_) return;
+        jnienv_ = env;
+        jvm_ = vm;
         hookDefineClass();
+        initialized_ = true;
     }
 
-    // capabilities ve version dölü
-    static jint GetVersion() {
-        return jnienv->GetVersion();
-    }
-    static jint AddCapabilities(const std::vector<jlong>& caps) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        capabilities.insert(capabilities.end(), caps.begin(), caps.end());
-        return JNI_OK;
-    }
-    static jint GetCapabilities(std::vector<jlong>& out) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        out = capabilities;
-        return JNI_OK;
-    }
-
-    // transformer callback
-    using TransformerCallback = std::function<std::vector<unsigned char>(const std::string&, const std::vector<unsigned char>&)>;
     static jint AddTransformer(TransformerCallback cb) {
         std::lock_guard<std::mutex> lk(mutex_);
-        transformers.push_back(cb);
+        transformers_.push_back(cb);
         return JNI_OK;
     }
 
-    // API
-    static jint GetLoadedClasses(std::vector<jclass>& classes) {
-        std::lock_guard<std::mutex> lk(mutex_);
-        classes = loadedClasses;
-        return JNI_OK;
-    }
-
-    // Eventleri tetikle
-    enum EventType { EV_CLASS_LOAD = 1, EV_CLASS_UNLOAD, EV_VM_INIT, EV_VM_DEATH };
-    using EventCallback = std::function<void(const std::string&)>;
     static jint SetEventNotificationMode(bool enable, EventType event, EventCallback cb) {
         std::lock_guard<std::mutex> lk(mutex_);
-        if (enable) eventHandlers[event] = cb;
-        else eventHandlers.erase(event);
+        if (enable) eventHandlers_[event] = cb;
+        else eventHandlers_.erase(event);
         return JNI_OK;
     }
 
 private:
-    static JNIEnv* jnienv;
-    static JavaVM* jvm;
-    static std::vector<jlong> capabilities;
-    static std::unordered_map<EventType, EventCallback> eventHandlers;
-    static std::vector<TransformerCallback> transformers;
-    static std::vector<jclass> loadedClasses;
+    static JNIEnv* jnienv_;
+    static JavaVM* jvm_;
+    static bool initialized_;
+    static std::vector<TransformerCallback> transformers_;
+    static std::vector<MethodHook> methodHooks_;
+    static std::unordered_map<EventType, EventCallback> eventHandlers_;
+    static std::vector<jclass> loadedClasses_;
     static std::mutex mutex_;
 
-    typedef jclass (JNICALL *FN_DefineClass)(JNIEnv*, const char*, jobject, const jbyte*, jsize);
-    static FN_DefineClass orig_DefineClass;
+    using FN_DefineClass = jclass(JNICALL*)(JNIEnv*, const char*, jobject, const jbyte*, jsize);
+    static FN_DefineClass orig_DefineClass_;
+
+    static std::vector<unsigned char> processBytecode(const std::string& clsName,
+                                                      const std::vector<unsigned char>& original) {
+        std::vector<unsigned char> data = original;
+        for (auto& mh : methodHooks_) {
+            if (mh.className == clsName) {
+                try {
+                    data = mh.converter(clsName, mh.methodName, mh.methodDesc, data);
+                } catch (const std::exception& e) {
+                    std::cerr << "[CustomJVMTI] Hook exception: " << e.what() << std::endl;
+                } catch (...) {
+                    std::cerr << "[CustomJVMTI] Hook unknown exception." << std::endl;
+                }
+            }
+        }
+        for (auto& tf : transformers_) {
+            try {
+                data = tf(clsName, data);
+            } catch (...) {
+                std::cerr << "[CustomJVMTI] Transformer exception." << std::endl;
+            }
+        }
+        return data;
+    }
 
     static jclass JNICALL Hooked_DefineClass(JNIEnv* env,
                                              const char* name,
                                              jobject loader,
                                              const jbyte* buf,
                                              jsize len) {
+        std::string cls = name ? name : "";
         std::vector<unsigned char> bytes(buf, buf + len);
-        // transformers
+
         {
             std::lock_guard<std::mutex> lk(mutex_);
-            for (auto &t : transformers) {
-                bytes = t(name ? name : "", bytes);
-            }
+            bytes = processBytecode(cls, bytes);
         }
-        // Call original
-        jclass cls = orig_DefineClass(env, name, loader, bytes.data(), (jsize)bytes.size());
-        if (cls) {
+
+        jclass clsObj = orig_DefineClass_(env, name, loader, bytes.data(), (jsize)bytes.size());
+        if (clsObj) {
             std::lock_guard<std::mutex> lk(mutex_);
-            loadedClasses.push_back((jclass)env->NewGlobalRef(cls));
-            // CLASS_LOAD 
-            auto it = eventHandlers.find(EV_CLASS_LOAD);
-            if (it != eventHandlers.end()) it->second(name ? name : "");
+            loadedClasses_.push_back((jclass)env->NewGlobalRef(clsObj));
+            auto it = eventHandlers_.find(EV_CLASS_LOAD);
+            if (it != eventHandlers_.end()) it->second(cls);
         }
-        return cls;
+        return clsObj;
     }
 
-    // JNI_DefineClass
     static void hookDefineClass() {
-        HMODULE hJVM = GetModuleHandleA("jvm.dll");
-        if (!hJVM) return;
-        void* addr = (void*)GetProcAddress(hJVM, "JVM_DefineClass");
-        if (!addr) return;
+        HMODULE hJvm = GetModuleHandleA("jvm.dll");
+        if (!hJvm) { std::cerr << "[CustomJVMTI] jvm.dll not found." << std::endl; return; }
+        void* addr = GetProcAddress(hJvm, "JVM_DefineClass");
+        if (!addr) { std::cerr << "[CustomJVMTI] JVM_DefineClass not found." << std::endl; return; }
+
+        orig_DefineClass_ = reinterpret_cast<FN_DefineClass>(addr);
         DWORD old;
         BYTE patch[5] = {0xE9};
-        FN_DefineClass target = (FN_DefineClass)addr;
-        orig_DefineClass = target;
-        DWORD_PTR rel = (BYTE*)&Hooked_DefineClass - (BYTE*)addr - 5;
+        intptr_t rel = reinterpret_cast<intptr_t>(&Hooked_DefineClass) - reinterpret_cast<intptr_t>(addr) - 5;
         memcpy(patch + 1, &rel, 4);
-        VirtualProtect(addr, 5, PAGE_EXECUTE_READWRITE, &old);
-        memcpy(addr, patch, 5);
-        VirtualProtect(addr, 5, old, &old);
+        if (VirtualProtect(addr, 5, PAGE_EXECUTE_READWRITE, &old)) {
+            memcpy(addr, patch, 5);
+            VirtualProtect(addr, 5, old, &old);
+            std::cerr << "[CustomJVMTI] Hook installed." << std::endl;
+        } else {
+            std::cerr << "[CustomJVMTI] Failed to install hook." << std::endl;
+        }
     }
 };
 
-// tanimlamalar
-JNIEnv* CustomJVMTI::jnienv = nullptr;
-JavaVM* CustomJVMTI::jvm = nullptr;
-std::vector<jlong> CustomJVMTI::capabilities;
-std::unordered_map<CustomJVMTI::EventType, CustomJVMTI::EventCallback> CustomJVMTI::eventHandlers;
-std::vector<CustomJVMTI::TransformerCallback> CustomJVMTI::transformers;
-std::vector<jclass> CustomJVMTI::loadedClasses;
+JNIEnv* CustomJVMTI::jnienv_ = nullptr;
+JavaVM* CustomJVMTI::jvm_ = nullptr;
+bool CustomJVMTI::initialized_ = false;
+std::vector<CustomJVMTI::TransformerCallback> CustomJVMTI::transformers_;
+std::vector<MethodHook> CustomJVMTI::methodHooks_;
+std::unordered_map<CustomJVMTI::EventType, CustomJVMTI::EventCallback> CustomJVMTI::eventHandlers_;
+std::vector<jclass> CustomJVMTI::loadedClasses_;
 std::mutex CustomJVMTI::mutex_;
-CustomJVMTI::FN_DefineClass CustomJVMTI::orig_DefineClass = nullptr;
+CustomJVMTI::FN_DefineClass CustomJVMTI::orig_DefineClass_ = nullptr;
 
-#endif // CUSTOM_CUSTOMJVMTI_HPP
-
-//aptal rakun
+#endif // CUSTOM_JVMTI_HPP
